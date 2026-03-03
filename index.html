@@ -384,8 +384,10 @@ function renderMsgs(msgs){
   });
   w.innerHTML=html;
 }
-function appendMsg(m){
+function appendMsg(m,fromRealtime){
   const w=document.getElementById('msgs');if(!w)return;
+  // Eigene Nachrichten via Realtime überspringen (bereits optimistisch angezeigt)
+  if(fromRealtime&&m.sender_id===me?.id)return;
   const e=w.querySelector('.empty-msgs');if(e)e.remove();
   const mine=m.sender_id===me?.id;
   const col=acol(m.sender_id||'0');
@@ -395,15 +397,22 @@ function appendMsg(m){
   w.appendChild(div);
 }
 function subMsgs(cid){
-  msgSub=sb.channel('msgs-'+cid).on('postgres_changes',{event:'INSERT',schema:'public',table:'messages',filter:'conv_id=eq.'+cid},p=>{appendMsg(p.new);scrollB();}).subscribe();
+  // Kein filter= Parameter — filtert client-side um Realtime-Bugs zu vermeiden
+  msgSub=sb.channel('room-'+cid+'-'+Date.now())
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'messages'},p=>{
+      if(p.new.conv_id===cid){ appendMsg(p.new,true); scrollB(); }
+    }).subscribe();
 }
 async function sendMsg(){
   const inp=document.getElementById('msg-inp');if(!inp)return;
   const content=inp.value.trim();if(!content||!activeConv)return;
   inp.value='';autoR(inp);
   const sname=myProfile?.display_name||me.email.split('@')[0];
+  // Nachricht sofort anzeigen (optimistic UI)
+  appendMsg({conv_id:activeConv.id,sender_id:me.id,sender_name:sname,content,created_at:new Date().toISOString()},false);
+  scrollB();
   const{error}=await sb.from('messages').insert({conv_id:activeConv.id,sender_id:me.id,sender_name:sname,content});
-  if(error){inp.value=content;alert('Fehler: '+error.message);return;}
+  if(error){alert('Fehler: '+error.message);return;}
   await sb.from('conversations').update({last_msg:content,updated_at:new Date().toISOString()}).eq('id',activeConv.id).catch(()=>{});
   const idx=allConvs.findIndex(c=>c.id===activeConv.id);if(idx>-1)allConvs[idx].last_msg=content;
   renderConvs(allConvs);
