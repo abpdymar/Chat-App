@@ -1,49 +1,56 @@
 <!DOCTYPE html>
-<html lang="de">
+<html>
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PrivateChat</title>
+<title>Private WhatsApp Style Chat</title>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 body{margin:0;font-family:Arial;background:#0f0f13;color:white;display:flex;height:100vh}
-.sidebar{width:300px;background:#1a1a22;display:flex;flex-direction:column}
+.sidebar{width:280px;background:#1a1a22;display:flex;flex-direction:column}
 .chatlist{flex:1;overflow:auto}
 .chatitem{padding:12px;border-bottom:1px solid #222;cursor:pointer}
 .chatitem:hover{background:#222}
 .chat{flex:1;display:flex;flex-direction:column}
 .messages{flex:1;overflow:auto;padding:15px}
-.msg{margin-bottom:10px}
-.me{text-align:right}
-input,button{padding:8px}
+.msg{margin:6px 0}
+.me{text-align:right;color:#5de5c8}
 .topbar{padding:10px;background:#1a1a22;display:flex;justify-content:space-between}
-.callOverlay{position:fixed;inset:0;background:#000;display:none;flex-direction:column;align-items:center;justify-content:center}
-video{width:300px;margin:10px}
+input,button{padding:8px}
+.typing{font-size:12px;color:#888}
+.callOverlay{
+position:fixed;inset:0;background:#000;
+display:none;flex-direction:column;
+align-items:center;justify-content:center;
+}
+video{width:280px;margin:8px}
 </style>
 </head>
 <body>
 
 <div class="sidebar">
-  <div style="padding:10px">
-    <button onclick="newChat()">Neuer Chat</button>
-  </div>
+  <button onclick="newChat()">Neuer Chat</button>
   <div class="chatlist" id="chatlist"></div>
 </div>
 
 <div class="chat">
   <div class="topbar">
     <span id="chatTitle">Kein Chat</span>
-    <button onclick="startCall()">📞</button>
+    <div>
+      <button onclick="startCall()">📞</button>
+    </div>
   </div>
   <div class="messages" id="messages"></div>
+  <div class="typing" id="typing"></div>
   <div style="display:flex">
-    <input id="msgInput" style="flex:1" onkeydown="if(event.key==='Enter')sendMsg()">
+    <input id="msgInput" style="flex:1"
+      oninput="sendTyping()"
+      onkeydown="if(event.key==='Enter')sendMsg()">
     <button onclick="sendMsg()">Senden</button>
   </div>
 </div>
 
 <div class="callOverlay" id="callOverlay">
-  <h2>Call läuft...</h2>
+  <h2 id="callStatus">Call läuft...</h2>
   <video id="remoteVideo" autoplay playsinline></video>
   <video id="localVideo" autoplay muted playsinline></video>
   <button onclick="endCall()">Beenden</button>
@@ -54,9 +61,12 @@ let sb;
 let user;
 let currentChat=null;
 let msgSub=null;
-let callChannel=null;
+let typingChannel=null;
+let presenceChannel=null;
+
 let pc=null;
 let localStream=null;
+let callChannel=null;
 
 const rtcConfig={iceServers:[{urls:"stun:stun.l.google.com:19302"}]};
 
@@ -64,6 +74,7 @@ async function init(){
 const url=prompt("Supabase URL");
 const key=prompt("Anon Key");
 sb=supabase.createClient(url,key);
+
 const email=prompt("Email");
 const pw=prompt("Passwort");
 
@@ -79,30 +90,59 @@ await sb.from("profiles").upsert({
   display_name:user.email.split("@")[0]
 });
 
+setupPresence();
 loadChats();
+}
+
+function setupPresence(){
+presenceChannel=sb.channel("online-users",{
+  config:{presence:{key:user.id}}
+});
+
+presenceChannel.subscribe(async(status)=>{
+  if(status==="SUBSCRIBED"){
+    await presenceChannel.track({online_at:new Date().toISOString()});
+  }
+});
 }
 
 async function loadChats(){
 const {data}=await sb.from("chats")
 .select("*")
 .or(`user1.eq.${user.id},user2.eq.${user.id}`);
+
 document.getElementById("chatlist").innerHTML="";
 data.forEach(c=>{
 let other=c.user1===user.id?c.user2:c.user1;
 let div=document.createElement("div");
 div.className="chatitem";
-div.innerText="Chat "+other;
+div.innerText="Chat mit "+other;
 div.onclick=()=>openChat(c);
 document.getElementById("chatlist").appendChild(div);
 });
 }
 
 async function newChat(){
-let other=prompt("User ID des anderen:");
-const {data}=await sb.from("chats").insert({
-user1:user.id,
-user2:other
-}).select().single();
+let email=prompt("E-Mail des Users:");
+if(!email)return;
+
+const {data:profile}=await sb.from("profiles")
+.select("*").eq("email",email).single();
+
+if(!profile){alert("User nicht gefunden");return;}
+if(profile.id===user.id){alert("Nicht möglich");return;}
+
+const {data:existing}=await sb.from("chats")
+.select("*")
+.or(`and(user1.eq.${user.id},user2.eq.${profile.id}),and(user1.eq.${profile.id},user2.eq.${user.id})`)
+.single();
+
+if(existing){openChat(existing);return;}
+
+const {data}=await sb.from("chats")
+.insert({user1:user.id,user2:profile.id})
+.select().single();
+
 loadChats();
 openChat(data);
 }
@@ -111,11 +151,20 @@ async function openChat(chat){
 currentChat=chat;
 document.getElementById("chatTitle").innerText="Chat geöffnet";
 loadMessages();
+
 if(msgSub)msgSub.unsubscribe();
 msgSub=sb.channel("room-"+chat.id)
 .on("postgres_changes",{event:"INSERT",schema:"public",table:"messages",filter:`chat_id=eq.${chat.id}`},
 payload=>appendMsg(payload.new))
 .subscribe();
+
+typingChannel=sb.channel("typing-"+chat.id)
+.on("broadcast",{event:"typing"},({payload})=>{
+if(payload.user!==user.id){
+document.getElementById("typing").innerText="Tippt...";
+setTimeout(()=>document.getElementById("typing").innerText="",1500);
+}
+}).subscribe();
 }
 
 async function loadMessages(){
@@ -123,6 +172,7 @@ const {data}=await sb.from("messages")
 .select("*")
 .eq("chat_id",currentChat.id)
 .order("created_at",{ascending:true});
+
 document.getElementById("messages").innerHTML="";
 data.forEach(m=>appendMsg(m));
 }
@@ -136,7 +186,7 @@ document.getElementById("messages").appendChild(div);
 
 async function sendMsg(){
 let val=document.getElementById("msgInput").value;
-if(!val)return;
+if(!val||!currentChat)return;
 document.getElementById("msgInput").value="";
 await sb.from("messages").insert({
 chat_id:currentChat.id,
@@ -145,16 +195,30 @@ content:val
 });
 }
 
+function sendTyping(){
+if(!typingChannel)return;
+typingChannel.send({
+type:"broadcast",
+event:"typing",
+payload:{user:user.id}
+});
+}
+
 async function startCall(){
 if(!currentChat)return;
 document.getElementById("callOverlay").style.display="flex";
+document.getElementById("callStatus").innerText="Calling...";
+
 localStream=await navigator.mediaDevices.getUserMedia({video:true,audio:true});
 document.getElementById("localVideo").srcObject=localStream;
+
 pc=new RTCPeerConnection(rtcConfig);
 localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+
 pc.ontrack=e=>{
 document.getElementById("remoteVideo").srcObject=e.streams[0];
 };
+
 callChannel=sb.channel("call-"+currentChat.id)
 .on("broadcast",{event:"offer"},async({payload})=>{
 await pc.setRemoteDescription(new RTCSessionDescription(payload));
